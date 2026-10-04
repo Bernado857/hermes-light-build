@@ -1,0 +1,192 @@
+name: Build Hermes Light for macOS ARM64
+run-name: Hermes Light ARM64 - ${{ inputs.source_commit }}
+
+'on':
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: 'Official NousResearch/hermes-agent full 40-character commit SHA'
+        required: true
+        type: string
+        default: '93782e9cc3b6d40eb28b7545708a126538127a60'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-light-macos-arm64
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS ARM64 Light (personal ad-hoc build)
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+      CI: 'true'
+      PYTHONDONTWRITEBYTECODE: '1'
+
+    steps:
+      - name: Validate immutable input and native architecture
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo '::error::Use an exact lowercase 40-character SHA'; exit 1; }
+          test "$(uname -m)" = arm64 || { echo '::error::An ARM64 runner is required'; exit 1; }
+          xcode-select -p
+          xcrun --show-sdk-path
+
+      - name: Check out official source, without stored credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ inputs.source_commit }}
+          path: upstream
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Select host Python (the official builder manages its own other tools)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Verify clean checkout
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+          test -f scripts/bundles/desktop.py
+          mkdir -p "$GITHUB_WORKSPACE/build-logs"
+
+      - name: Build native Light DMG and ZIP with ad-hoc signing
+        id: build
+        working-directory: upstream
+        run: |
+          set -euo pipefail
+          ulimit -n 16384 2>/dev/null || true
+          python3 scripts/bundles/desktop.py \
+            --commit "$SOURCE_COMMIT" --variant light \
+            --work "$RUNNER_TEMP/hermes-light-job" \
+            --cache "$RUNNER_TEMP/hermes-light-cache" \
+            -- -c.mac.identity=- \
+            2>&1 | tee "$GITHUB_WORKSPACE/build-logs/native-build.log"
+
+      - name: Verify architecture, signature, Light identity and download files
+        id: verify
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, json, os, plistlib, shutil, subprocess
+          release = Path(os.environ["GITHUB_WORKSPACE"]) / "upstream/apps/desktop/release"
+          apps = list(release.glob("mac-arm64/*.app"))
+          assert len(apps) == 1, f"Expected one ARM64 app, found {apps}"
+          app = apps[0]
+          resources = app / "Contents/Resources"
+          stamp = json.loads((resources / "install-stamp.json").read_text())
+          assert stamp["payload"] == "light", "Not a Light build"
+          assert stamp["commit"] == os.environ["SOURCE_COMMIT"], "Source identity mismatch"
+          assert stamp["updateMechanism"] == "external", "Personal builds must not use release update channels"
+          assert not (resources / "agent-payload").exists(), "Unexpected local backend payload"
+          with (app / "Contents/Info.plist").open("rb") as f:
+              info = plistlib.load(f)
+          executable = app / "Contents/MacOS" / info["CFBundleExecutable"]
+          arches = subprocess.check_output(["lipo", "-archs", str(executable)], text=True).strip().split()
+          assert arches == ["arm64"], f"Unexpected architectures: {arches}"
+          subprocess.run(["codesign", "--verify", "--deep", "--strict", "--verbose=2", str(app)], check=True)
+          packages = sorted(release.glob("*.dmg")) + sorted(release.glob("*.zip"))
+          assert any(p.suffix == ".dmg" for p in packages), "Missing DMG"
+          assert any(p.suffix == ".zip" for p in packages), "Missing ZIP"
+          out = Path(os.environ["GITHUB_WORKSPACE"]) / "artifacts"
+          out.mkdir()
+          sums = []
+          for p in packages:
+              assert p.stat().st_size > 0
+              copied = Path(shutil.copy2(p, out / p.name))
+              with copied.open("rb") as f:
+                  digest = hashlib.file_digest(f, "sha256").hexdigest()
+              sums.append(f"{digest}  {copied.name}")
+          (out / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n")
+          report = {"source_repository": "NousResearch/hermes-agent", "commit": stamp["commit"],
+                    "target": "darwin-arm64", "payload": "light", "signature": "ad-hoc",
+                    "apple_notarized": False, "codesign_verified": True, "backend_payload_absent": True,
+                    "installation_on_M5_verified": False}
+          (out / "BUILD-INFO.json").write_text(json.dumps(report, indent=2) + "\n")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"LIGHT_APP={app}\nLIGHT_EXECUTABLE={executable}\n")
+          print(json.dumps(report, indent=2))
+          PY
+
+      - name: Smoke-test native client startup in isolated CI user data
+        id: smoke
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json, os, subprocess, time
+          workspace = Path(os.environ["GITHUB_WORKSPACE"])
+          log = workspace / "build-logs/client-startup.log"
+          env = os.environ.copy()
+          env["HERMES_DESKTOP_USER_DATA_DIR"] = str(Path(env["RUNNER_TEMP"]) / "hermes-light-smoke-userdata")
+          env["HERMES_HOME"] = str(Path(env["RUNNER_TEMP"]) / "hermes-light-smoke-home")
+          with log.open("w") as f:
+              process = subprocess.Popen([env["LIGHT_EXECUTABLE"]], env=env, stdout=f, stderr=subprocess.STDOUT)
+              try:
+                  deadline = time.monotonic() + 15
+                  while time.monotonic() < deadline:
+                      assert process.poll() is None, f"Client exited early: {process.returncode}; inspect client-startup.log"
+                      time.sleep(0.5)
+              finally:
+                  if process.poll() is None:
+                      process.terminate()
+                      try:
+                          process.wait(timeout=10)
+                      except subprocess.TimeoutExpired:
+                          process.kill()
+                          process.wait()
+          p = workspace / "artifacts/BUILD-INFO.json"
+          report = json.loads(p.read_text())
+          report["native_ci_startup_smoke_passed"] = True
+          report["remote_backend_connection_verified"] = False
+          p.write_text(json.dumps(report, indent=2) + "\n")
+          print("Native CI startup smoke passed. M5 installation and remote login still require user verification.")
+          PY
+
+      - name: Upload checked personal-use installers
+        id: artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-light-macos-arm64-${{ github.run_id }}
+          path: |
+            artifacts/*.dmg
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt
+            artifacts/BUILD-INFO.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+      - name: Upload diagnostics even if build fails
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hermes-light-build-logs-${{ github.run_id }}
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report completion
+        run: |
+          {
+            echo '## Hermes Light for macOS ARM64'
+            echo "Source commit: \`$SOURCE_COMMIT\`"
+            echo 'Download the installer artifact at the bottom of this run page.'
+            echo 'Personal ad-hoc build: not signed by Nous Research and not Apple-notarized.'
+            echo 'The CI architecture/signature/startup checks do not prove M5 installation or remote connectivity.'
+            echo 'No backend configuration, credentials, memory or chat data is bundled.'
+          } >> "$GITHUB_STEP_SUMMARY"
