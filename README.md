@@ -40,10 +40,11 @@ macOS 可能阻止首次打开；仅在确认来源是你自己这次构建、�
 
 ## 验证边界与安全
 
-- 拉取官方 `NousResearch/hermes-agent` 的指定完整 commit SHA，调用官方 `scripts/bundles/desktop.py --variant light`。
+- 拉取官方 `NousResearch/hermes-agent` 的指定完整 commit SHA，调用官方 `scripts/bundles/desktop.py --variant light`，保持官方源码不变。原生驱动生成的 DMG/ZIP 仅是中间产物，不上传；`--dir` 并不能覆盖驱动显式指定的安装器目标。
+- 个人打包脚本使用官方构建依赖里的 `@electron/osx-sign` 和上游 entitlements 对生成的 `.app` 做 ad-hoc 签名，再在官方 release 目录之外的独立 `personal-signed-packages` 目录生成最终 DMG/ZIP；不向 electron-builder 27 传递已失效的 `mac.identity` 参数。
 - 默认 SHA 是创建这个工作流时已核对构建接口的官方源码；不是“已验证与你的后端完全匹配”。更换 SHA 后仍需接入验收。
 - Actions 使用原生 `macos-15` ARM64 runner，并检查实际 `uname -m`。
-- 检查包内 Light stamp、源码身份、ARM64 架构、ad-hoc 签名，以及未带 `agent-payload`。
+- 发布前分别解压最终 ZIP、只读挂载最终 DMG，检查每份包内 `.app` 的完整原始 Light stamp、commit、external 更新机制、ARM64 架构、严格 deep codesign/ad-hoc 签名、未带 `agent-payload`，并比较可执行文件 SHA256 与签名后的原始 `.app`。拒绝多余产物、无效路径或清单；只上传明确指定的两个最终安装器。`BUILD-INFO.json` 的校验声明仅在这些分发副本均通过后生成。
 - 在云端隔离用户目录启动客户端 15 秒，检查没有提前退出；这不是完整 UI 功能或 M5 安装验收。
 - M5 实际安装、审批交互、远端登录、HTTP/WebSocket、会话展示仍需在你设备上验证。
 - 不需要添加 Actions Secrets；不上传 `.hermes`、API Key、私钥、OAuth、会话、记忆或定时任务。
@@ -59,4 +60,4 @@ macOS 可能阻止首次打开；仅在确认来源是你自己这次构建、�
 python -m unittest discover -s tests -v
 ```
 
-这些测试验证手动触发策略、固定 SHA、构建参数、权限、校验与产物契约、Shell/Python 语法；不代替真实云端构建。
+这些测试验证手动触发策略、固定 SHA、构建参数、权限、校验与产物契约、Shell/Python 语法；不代替真实云端构建。原生打包回归测试需在 macOS 上显式设置 `HERMES_PACKAGING_FIXTURE`，指向隔离的、带真实 ARM64 Mach-O 的合成测试源码树（含签名依赖）。合成 fixture 不是 Hermes 应用或可供安装的真实构建。
